@@ -7,7 +7,7 @@ Research Buddy is a modular AI backend that streamlines literature review with c
 ## Table of Contents
 - [Features](#features)
 - [Architecture](#architecture)
-- [Project Structure](#project-structure)
+- [Project-Structure](#project-structure)
 - [Quickstart](#quickstart)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
@@ -51,8 +51,10 @@ research_buddy_backend/
 │   │   └── predictor.py       # Inference logic
 │   ├── schemas/
 │   │   └── predict.py         # Pydantic I/O schemas
-│   └── routes/
-│       └── predict.py         # /predict, /keywords, /summary, /health
+│   ├── routes/
+│   │   └── predict.py         # /predict, /keywords, /summary, /health
+│   ├── Data/                  # Internal assets for classification and NLP models
+│   └── nltk_data/             # NLTK tokenizers, corpora, and linguistic utilities
 │
 ├── data/                      # Models, tokenizers, vectorizers (not tracked)
 │   ├── logistic_model.pkl
@@ -62,6 +64,10 @@ research_buddy_backend/
 ├── requirements.txt
 └── run.py                     # Uvicorn launcher
 ```
+
+> **Note:**  
+> The `app/Data/` and `app/nltk_data/` folders contain important resources that support text preprocessing and NLP pipelines.  
+> These directories are not publicly distributed. To access them or contribute updates, please contact the project owner.
 
 ---
 
@@ -104,24 +110,7 @@ LOG_LEVEL=info
 ENABLE_SUMMARIZER=true
 ```
 
----
 
-## API Reference
-
-| Endpoint | Method | Description |
-|-----------|--------|-------------|
-| `/api/predict` | POST | Classify research abstracts |
-| `/api/keywords` | POST | Extract keywords |
-| `/api/summary` | POST | Generate summaries |
-| `/api/health` | GET | Health check |
-
-Example request:
-```json
-{
-  "text": "This paper introduces a transformer-based model for biomedical literature classification.",
-  "model": "bert"
-}
-```
 
 ---
 
@@ -167,8 +156,102 @@ Unauthorized redistribution or commercial use is prohibited.
 
 ---
 
+## Reference White Paper
+Read the full Research Buddy white paper here:  
+🔗 [https://turjo-ml-dl.turjo-jaman.com/research_buddy.html](https://turjo-ml-dl.turjo-jaman.com/research_buddy.html)
+
+---
+
 ## Author
 
 **Nur A. Jaman (Turjo)**  
 AI & EdTech Innovator | Full-Stack Engineer  
 🌐 [https://turjo-jaman.com](https://turjo-jaman.com)
+
+
+---
+
+## 🧩 API Reference
+
+### 🔮 Prediction API (`/api/predict`)
+| Endpoint | Method | Description |
+|-----------|--------|-------------|
+| `/api/predict` | **POST** | Classifies research abstracts using the selected ML or transformer model (`model_name`: "ALL", "bert", etc.). |
+| `/api/predict-pdf` | **POST** | Extracts text from a PDF file and performs classification with the chosen model. |
+| `/api/extract_keywords_pdf` | **POST** | Extracts top keywords from the first two pages of a PDF using KeyBERT. |
+| `/api/extract_keywords_text` | **POST** | Extracts keywords from a raw abstract text via KeyBERT. |
+| `/api/extract_keywords_gemini` | **POST** | Extracts context-aware keywords using Gemini LLM. |
+| `/api/summarize` | **POST** | Summarizes abstracts using either Gemini or BART summarization models. |
+
+**Example Request**
+```json
+{
+  "abstract": "This paper introduces a transformer-based model for biomedical literature classification.",
+  "model_name": "bert"
+}
+```
+**Example Response**
+```json
+{
+  "predicted_label": "Computer Science",
+  "confidence": 0.94
+}
+```
+
+---
+
+### 👤 Authentication API (`/api/auth`)
+| Endpoint | Method | Description |
+|-----------|--------|-------------|
+| `/api/signup` | **POST** | Registers a new user and returns a JWT token stored in an HttpOnly cookie. |
+| `/api/login` | **POST** | Authenticates user credentials and issues a JWT cookie. |
+| `/api/logout` | **POST** | Logs out the user by deleting the token cookie. |
+| `/api/me` | **GET** | Returns the authenticated user’s email from the JWT token. |
+
+**Note:**  
+All authentication routes use cookie-based JWTs and integrate with the middleware in `app/middlewares/user_protect.py`.
+
+---
+
+### 📚 Dashboard API (`/api/dashboard`)
+| Endpoint | Method | Description |
+|-----------|--------|-------------|
+| `/api/dashboard/papers` | **POST** | Uploads a research paper (PDF) to Backblaze B2 and stores metadata in MongoDB. |
+| `/api/dashboard/papers` | **GET** | Lists all uploaded papers for the authenticated user (pagination, search, filters supported). |
+| `/api/dashboard/papers/{paper_id}` | **GET** | Retrieves details for a single paper. |
+| `/api/dashboard/papers/{paper_id}` | **PUT** | Updates paper information (title, abstract, summary, etc.). |
+| `/api/dashboard/papers/{paper_id}` | **DELETE** | Deletes both the file from B2 and its database record. |
+| `/api/dashboard/papers/{paper_id}/download` | **GET** | Downloads a paper from B2 storage. |
+| `/api/dashboard/papers/{paper_id}/favorite` | **PUT** | Marks or unmarks a paper as a favorite. |
+
+**Protected Routes:** All `/dashboard/*` endpoints are protected by the `userProtect` middleware.
+
+---
+
+### 🧑‍🔬 Faculty Scraper Agent API (`/api/faculty`)
+| Endpoint | Method | Description |
+|-----------|--------|-------------|
+| `/api/faculty/scrape` | **POST** | Launches an adaptive or deep faculty scraping engine for a given university/faculty page. Returns Excel file and summary stats. |
+| `/api/faculty/download/{filename}` | **GET** | Downloads a generated Excel file containing scraped faculty data. |
+| `/api/faculty/progress` | **GET** | Streams scraping progress via Server-Sent Events (SSE). |
+
+**Engines Supported:**  
+- Adaptive Faculty Scraper (default)  
+- Enhanced Deep Faculty Scraper (for large-scale or structured university portals)
+
+---
+
+### 🧠 Faculty Scrape Database API (`/api/faculty-scrape-db`)
+| Endpoint | Method | Description |
+|-----------|--------|-------------|
+| `/api/faculty-scrape-db/save` | **POST** | Saves a completed scraping session result to the database. |
+| `/api/faculty-scrape-db/list` | **GET** | Returns paginated list of previously saved scrape sessions. |
+| `/api/faculty-scrape-db/{scrape_id}` | **GET** | Retrieves a specific scraping record by ID. |
+| `/api/faculty-scrape-db/{scrape_id}` | **DELETE** | Permanently deletes a scraping record. |
+
+---
+
+### 🧭 Root Endpoint
+| Endpoint | Method | Description |
+|-----------|--------|-------------|
+| `/` | **GET** | Returns `{ "message": "Research Buddy Backend is Running" }` |
