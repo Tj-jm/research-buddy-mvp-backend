@@ -1,0 +1,119 @@
+from typing import TypedDict
+from langgraph.graph import StateGraph, END
+
+class MyState(TypedDict, total=False):
+    text: str
+    summary: str
+
+def load_text(state: MyState):
+    return {"text": "LangGraph is great for pipelines."}
+
+def summarize(state: MyState):
+    return {"summary": state["text"][:20] + "..."}
+
+graph = StateGraph(MyState)
+graph.add_node("loader", load_text)
+graph.add_node("summarizer", summarize)
+
+graph.set_entry_point("loader")
+graph.add_edge("loader", "summarizer")
+graph.add_edge("summarizer", END)
+
+app = graph.compile()
+print(app.invoke({}))
+
+
+ ┌──────────────────┐
+ │   Entry Point    │
+ │   "loader"       │
+ └───────┬──────────┘
+         │ (initial empty state {})
+         ▼
+ ┌──────────────────┐
+ │  Node: loader    │
+ │  • Adds text     │
+ │  {"text": "..."} │
+ └───────┬──────────┘
+         │ (state passed forward)
+         ▼
+ ┌──────────────────┐
+ │ Node: summarizer │
+ │ • Reads text     │
+ │ • Adds summary   │
+ │ {"summary": "..."}│
+ └───────┬──────────┘
+         │ (updated state)
+         ▼
+ ┌──────────────────┐
+ │      END         │
+ │ Final State:     │
+ │ {                │
+ │  "text": "...",  │
+ │  "summary": "..."}│
+ └──────────────────┘
+
+
+Key Ideas
+
+State = shared dictionary that flows through the graph.
+
+Nodes = functions that read + update the state.
+
+Edges = define what happens next.
+
+END = marks completion, returns final state.
+
+
+
+ ┌───────────────────────┐
+ │   Entry Point         │
+ │   "collect"           │
+ │   Input: directory URL│
+ └──────────┬────────────┘
+            ▼
+ ┌───────────────────────┐
+ │ Node: collect         │
+ │ • Finds profile links │
+ │ • Adds profile_urls   │
+ └──────────┬────────────┘
+            ▼
+ ┌───────────────────────┐
+ │ Node: profile_scrape  │
+ │ • Visits each profile │
+ │ • Extracts raw text   │
+ │ • Adds raw_profiles   │
+ └──────────┬────────────┘
+            ▼
+ ┌───────────────────────┐
+ │ Node: summarize       │
+ │ • Calls LLM (Gemini / │
+ │   local)              │
+ │ • Extracts JSON fields│
+ │ • Adds summaries      │
+ └──────────┬────────────┘
+            ▼
+ ┌───────────────────────┐
+ │ Node: aggregate       │
+ │ • Normalizes fields   │
+ │ • Ensures flat schema │
+ │ • Adds normalized[]   │
+ └──────────┬────────────┘
+            ▼
+ ┌───────────────────────┐
+ │ Node: export          │
+ │ • Builds CSV + base64 │
+ │ • Adds csv_filename   │
+ │ • Adds csv_base64     │
+ └──────────┬────────────┘
+            ▼
+ ┌───────────────────────┐
+ │         END           │
+ │ Final State: {        │
+ │  directory_url,        │
+ │  profile_urls,         │
+ │  raw_profiles,         │
+ │  summaries,            │
+ │  normalized,           │
+ │  csv_filename,         │
+ │  csv_base64 }          │
+ └───────────────────────┘

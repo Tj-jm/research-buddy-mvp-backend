@@ -1,0 +1,50 @@
+# Virtual environment
+venv/
+.env
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and runtime data
+*.log
+*.sqlite3
+*.db
+*.pid
+
+# Project-specific data folders
+app/data/
+faculty_documents_deep/
+faculty_scraping_quick/
+
+# Large or sensitive assets
+nltk_data/
+downloads/
+uploads/
+datasets/
+checkpoints/
+models/
+output/
+results/
+
+# Jupyter or notebook checkpoints (if any)
+.ipynb_checkpoints/
+
+# Dependencies
+requirements.txt.lock
+Pipfile.lock

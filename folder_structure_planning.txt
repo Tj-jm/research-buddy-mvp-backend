@@ -1,0 +1,28 @@
+research-buddy/
+│
+├── app/                            # Streamlit application code
+│   ├── main.py                     # Entry point for Streamlit app
+│   ├── components/                 # Modular UI components
+│   │   ├── uploader.py
+│   │   ├── prediction.py
+│   │   ├── summarizer.py
+│   │   └── qna_module.py
+│   ├── utils/                      # Utility functions
+│   │   ├── pdf_reader.py           # PDF to text logic
+│   │   ├── text_cleaner.py
+│   │   └── model_utils.py
+│
+├── models/                         # Trained and serialized models
+│   ├── nb_model.pkl
+│   └── logreg_model.pkl
+│
+├── data/                           # Sample abstracts / test data
+│   └── sample_test_data.csv
+│
+├── notebooks/                      # Jupyter/Colab notebooks for model training
+│   ├── train_nb_model.ipynb
+│   └── train_logreg_model.ipynb
+│
+├── requirements.txt                # All dependencies
+├── README.md
+└── .gitignore

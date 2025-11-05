@@ -1,0 +1,116 @@
+===========================
+  MOTOR (FastAPI + MongoDB)
+===========================
+
+🔹 Setup
+--------
+from motor.motor_asyncio import AsyncIOMotorClient
+
+client = AsyncIOMotorClient("mongodb://localhost:27017")
+db = client["research_buddy"]
+
+# Access collection
+papers = db["papers"]
+
+--------------------------------
+🔹 Insert Documents
+--------------------------------
+# Single insert
+result = await papers.insert_one({"title": "AI", "abstract": "Cool stuff"})
+print(result.inserted_id)
+
+# Multiple insert
+docs = [
+    {"title": "ML", "abstract": "Neural networks"},
+    {"title": "NLP", "abstract": "Transformers"},
+]
+result = await papers.insert_many(docs)
+print(result.inserted_ids)
+
+--------------------------------
+🔹 Find Documents
+--------------------------------
+# Find one
+doc = await papers.find_one({"title": "AI"})
+print(doc)
+
+# Find by _id
+from bson import ObjectId
+doc = await papers.find_one({"_id": ObjectId("64f2...")})
+
+# Find many (cursor)
+cursor = papers.find({"abstract": {"$regex": "net"}})
+async for doc in cursor:
+    print(doc)
+
+# Limit & sort
+cursor = papers.find().sort("title", 1).limit(5)
+async for doc in cursor:
+    print(doc)
+
+--------------------------------
+🔹 Update Documents
+--------------------------------
+# Update one
+await papers.update_one(
+    {"title": "AI"},
+    {"$set": {"abstract": "Updated abstract"}}
+)
+
+# Update many
+await papers.update_many(
+    {"abstract": {"$regex": "network"}},
+    {"$set": {"category": "ML"}}
+)
+
+--------------------------------
+🔹 Delete Documents
+--------------------------------
+# Delete one
+await papers.delete_one({"title": "AI"})
+
+# Delete many
+await papers.delete_many({"category": "ML"})
+
+--------------------------------
+🔹 Counting & Existence
+--------------------------------
+count = await papers.count_documents({})
+print("Total docs:", count)
+
+exists = await papers.find_one({"title": "AI"})
+if exists:
+    print("Found!")
+
+--------------------------------
+🔹 Indexes
+--------------------------------
+# Create index
+await papers.create_index("title")
+
+# Compound index
+await papers.create_index([("title", 1), ("abstract", -1)])
+
+--------------------------------
+🔹 Aggregation
+--------------------------------
+pipeline = [
+    {"$match": {"category": "ML"}},
+    {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+]
+cursor = papers.aggregate(pipeline)
+async for doc in cursor:
+    print(doc)
+
+--------------------------------
+🔹 Transactions (Replica Set)
+--------------------------------
+async with await client.start_session() as s:
+    async with s.start_transaction():
+        await papers.insert_one({"title": "Inside Txn"}, session=s)
+        await papers.update_one({"title": "AI"}, {"$set": {"status": "done"}}, session=s)
+
+--------------------------------
+🔹 Close Connection
+--------------------------------
+client.close()

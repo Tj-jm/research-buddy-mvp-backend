@@ -1,0 +1,1717 @@
+import requests
+from bs4 import BeautifulSoup
+import json
+import csv
+import re
+from urllib.parse import urljoin, urlparse
+import time
+from typing import List, Dict, Optional
+import pandas as pd
+import os
+from app.utils.progress import set_progress
+
+# Try to import Selenium for JavaScript-heavy pages
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+    print("Selenium not available. Install with: pip install selenium")
+
+class EnhancedFacultyScraper:
+    def __init__(self, use_selenium=False, deep_scrape=True, max_profile_visits=None):
+        self.use_selenium = use_selenium and SELENIUM_AVAILABLE
+        self.deep_scrape = deep_scrape
+        self.max_profile_visits = max_profile_visits
+        self.visited_urls = set()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        
+        # Cache for scraped pages to avoid re-scraping
+        self.page_cache = {}
+        
+        if self.use_selenium:
+            self.setup_selenium_driver()
+    
+    def setup_selenium_driver(self):
+        """Setup Selenium WebDriver with appropriate options."""
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--window-size=1920,1080')
+        
+        try:
+            self.driver = webdriver.Chrome(options=chrome_options)
+        except Exception as e:
+            print(f"Failed to setup Chrome driver: {e}")
+            self.use_selenium = False
+    
+    def get_page_content(self, url: str) -> Optional[BeautifulSoup]:
+        """Fetch and parse the webpage content with caching."""
+        if url in self.page_cache:
+            return self.page_cache[url]
+            
+        if self.use_selenium:
+            soup = self._get_content_selenium(url)
+        else:
+            soup = self._get_content_requests(url)
+            
+        if soup:
+            self.page_cache[url] = soup
+        return soup
+    
+    def _get_content_requests(self, url: str) -> Optional[BeautifulSoup]:
+        """Fetch content using requests."""
+        try:
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
+            return BeautifulSoup(response.content, 'html.parser')
+        except Exception as e:
+            print(f"Error fetching {url} with requests: {e}")
+            return None
+    
+    def _get_content_selenium(self, url: str) -> Optional[BeautifulSoup]:
+        """Fetch content using Selenium (handles JavaScript)."""
+        try:
+            self.driver.get(url)
+            time.sleep(4)  # Wait longer for content to load
+            html = self.driver.page_source
+            return BeautifulSoup(html, 'html.parser')
+        except Exception as e:
+            print(f"Error fetching {url} with Selenium: {e}")
+            return None
+
+    def scrape_faculty(self, url: str) -> List[Dict]:
+        """Main method to scrape faculty from any university URL."""
+        print(f"Scraping faculty from: {url}")
+        
+        # Handle pagination - try to get all pages
+        all_faculty = []
+        base_url = url
+        
+        # Check if this is a paginated URL
+        if '/page/' in url:
+            # Extract base URL and start from page 1
+            base_url = re.sub(r'/page/\d+/', '/', url)
+            page_num = 1
+        else:
+            page_num = 1
+            
+        while True:
+            if page_num == 1:
+                current_url = base_url
+            else:
+                # Try common pagination patterns
+                pagination_urls = [
+                    f"{base_url.rstrip('/')}/page/{page_num}/",
+                    f"{base_url}?page={page_num}",
+                    f"{base_url}&page={page_num}" if '?' in base_url else f"{base_url}?page={page_num}"
+                ]
+                current_url = pagination_urls[0]  # Start with most common pattern
+            
+            print(f"Fetching page {page_num}: {current_url}")
+            soup = self.get_page_content(current_url)
+            
+            if not soup:
+                print(f"Failed to fetch page {page_num}")
+                break
+            
+            # Extract faculty from current page
+            page_faculty = self._extract_faculty_adaptive(soup, current_url)
+            
+            if not page_faculty:
+                print(f"No faculty found on page {page_num}")
+                if page_num == 1:
+                    # Try alternative URL patterns for first page
+                    for alt_url in pagination_urls[1:]:
+                        print(f"Trying alternative URL: {alt_url}")
+                        alt_soup = self.get_page_content(alt_url)
+                        if alt_soup:
+                            page_faculty = self._extract_faculty_adaptive(alt_soup, alt_url)
+                            if page_faculty:
+                                break
+                
+                if not page_faculty:
+                    break
+            
+            print(f"Found {len(page_faculty)} faculty on page {page_num}")
+            all_faculty.extend(page_faculty)
+            
+            # Check if there are more pages
+            if not self._has_next_page(soup) or page_num >= 20:  # Limit to prevent infinite loops
+                break
+                
+            page_num += 1
+            time.sleep(1)  # Be respectful between requests
+        
+        print(f"Total faculty found across all pages: {len(all_faculty)}")
+        
+        # Remove duplicates
+        all_faculty = self._clean_and_deduplicate(all_faculty)
+        print(f"After deduplication: {len(all_faculty)} unique faculty members")
+        
+        # Show first few results for debugging
+        print("\nFirst few results:")
+        for i, faculty in enumerate(all_faculty[:3], 1):
+            print(f"{i}. Name: {faculty.get('name', 'No name')}")
+            print(f"   Title: {faculty.get('title', 'No title')}")
+            print(f"   Email: {faculty.get('email', 'No email')}")
+            print(f"   Research: {(faculty.get('research_interests', 'No research'))[:100]}...")
+            print(f"   Profile URL: {faculty.get('profile_url', 'No URL')}")
+            print()
+        
+        # Deep scrape individual profiles if enabled
+        if self.deep_scrape and all_faculty:
+            print("Starting deep scrape of individual faculty profiles...")
+            all_faculty = self.deep_scrape_profiles(all_faculty, base_url)
+        
+        return all_faculty
+
+    def _has_next_page(self, soup: BeautifulSoup) -> bool:
+        """Check if there are more pages to scrape."""
+        # Look for common pagination indicators
+        next_indicators = [
+            'a[href*="page"]',
+            'a[href*="next"]',
+            '.next',
+            '.pagination a',
+            '[class*="next"]',
+            '[class*="page"]'
+        ]
+        
+        for indicator in next_indicators:
+            elements = soup.select(indicator)
+            for elem in elements:
+                text = elem.get_text().lower()
+                if any(word in text for word in ['next', '>', 'more', str(int(re.search(r'/page/(\d+)/', soup.find('link', {'rel': 'canonical'})['href']).group(1)) + 1) if soup.find('link', {'rel': 'canonical'}) and '/page/' in soup.find('link', {'rel': 'canonical'}).get('href', '') else '']):
+                    return True
+        
+        return False
+
+    def _extract_faculty_adaptive(self, soup: BeautifulSoup, base_url: str) -> List[Dict]:
+        """Enhanced adaptive extraction with better directory page handling."""
+        faculty_list = []
+        
+        # Strategy 1: Look for faculty cards/profiles (most common)
+        faculty_cards = self._find_faculty_cards(soup, base_url)
+        faculty_list.extend(faculty_cards)
+        
+        # Strategy 2: Look for faculty in dedicated sections
+        section_faculty = self._extract_from_faculty_sections(soup, base_url)
+        faculty_list.extend(section_faculty)
+        
+        # Strategy 3: Look for faculty in table rows
+        table_faculty = self._extract_from_tables(soup, base_url)
+        faculty_list.extend(table_faculty)
+        
+        # Strategy 4: Look for faculty in list items
+        list_faculty = self._extract_from_lists(soup, base_url)
+        faculty_list.extend(list_faculty)
+        
+        # Strategy 5: Look for faculty in generic containers
+        container_faculty = self._extract_from_containers(soup, base_url)
+        faculty_list.extend(container_faculty)
+        
+        # Remove duplicates and invalid entries
+        faculty_list = self._clean_and_deduplicate(faculty_list)
+        
+        return faculty_list
+
+    def _extract_from_faculty_sections(self, soup: BeautifulSoup, base_url: str) -> List[Dict]:
+        """Extract from dedicated faculty sections with enhanced patterns."""
+        faculty_list = []
+        
+        # Look for common faculty section patterns
+        section_selectors = [
+            'section[class*="faculty"]',
+            'div[class*="faculty"]',
+            'div[id*="faculty"]',
+            'article[class*="faculty"]',
+            '.faculty-grid',
+            '.faculty-list',
+            '.people-grid',
+            '.staff-grid',
+            '[class*="person"]',
+            '[class*="member"]'
+        ]
+        
+        for selector in section_selectors:
+            sections = soup.select(selector)
+            for section in sections:
+                # Look for individual faculty within the section
+                individual_faculty = self._extract_individuals_from_section(section, base_url)
+                faculty_list.extend(individual_faculty)
+        
+        return faculty_list
+
+    def _extract_individuals_from_section(self, section, base_url: str) -> List[Dict]:
+        """Extract individual faculty from a section."""
+        faculty_list = []
+        
+        # Look for individual faculty containers within the section
+        individual_selectors = [
+            'div[class*="card"]',
+            'div[class*="item"]',
+            'div[class*="person"]',
+            'div[class*="profile"]',
+            'div[class*="member"]',
+            'article',
+            '.faculty-item',
+            '.person-item'
+        ]
+        
+        for selector in individual_selectors:
+            items = section.select(selector)
+            for item in items:
+                if self._looks_like_individual_faculty(item):
+                    faculty_info = self._extract_from_faculty_item(item, base_url)
+                    if faculty_info and self._is_valid_faculty_info(faculty_info):
+                        faculty_list.append(faculty_info)
+        
+        return faculty_list
+
+    def _looks_like_individual_faculty(self, element) -> bool:
+        """Enhanced check for individual faculty items."""
+        text = element.get_text().lower()
+        
+        # Must have reasonable amount of text but not too much (not a whole page)
+        if len(text) < 30 or len(text) > 1500:
+            return False
+        
+        # Look for faculty indicators
+        faculty_indicators = [
+            'professor', 'dr.', 'ph.d', 'assistant', 'associate', 'chair', 
+            'director', 'lecturer', 'instructor', 'emeritus'
+        ]
+        has_title = any(indicator in text for indicator in faculty_indicators)
+        
+        # Look for contact info
+        has_email = '@' in text
+        has_phone = bool(re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text))
+        
+        # Look for name pattern
+        has_name = bool(re.search(r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b', element.get_text()))
+        
+        # Check if it has an image (common for faculty profiles)
+        has_image = element.find('img') is not None
+        
+        # Check for profile links
+        has_profile_link = any(
+            link.get('href', '').strip() and not link.get('href', '').startswith('mailto:')
+            for link in element.find_all('a', href=True)
+        )
+        
+        return has_name and (has_title or has_email or has_phone or has_image or has_profile_link)
+
+    def _extract_from_faculty_item(self, item, base_url: str) -> Dict:
+        """Extract comprehensive info from a faculty item with directory-specific enhancements."""
+        faculty_info = {}
+        
+        # Extract name with improved priority
+        name = self._extract_name_comprehensive(item)
+        if name:
+            faculty_info['name'] = name
+        
+        # Extract contact and other info
+        contact_info = self._extract_contact_info_enhanced(item, base_url)
+        faculty_info.update(contact_info)
+        
+        # Extract research interests from directory page (important addition)
+        directory_research = self._extract_research_from_directory_item(item)
+        if directory_research:
+            faculty_info['research_interests'] = directory_research
+        
+        # Extract additional directory-specific info
+        additional_info = self._extract_additional_directory_info(item, base_url)
+        faculty_info.update(additional_info)
+        
+        return faculty_info
+
+    def _extract_name_comprehensive(self, element) -> Optional[str]:
+        """Enhanced name extraction with multiple strategies."""
+        # Strategy 1: Look for links containing names (highest priority)
+        links = element.find_all('a', href=True)
+        for link in links:
+            href = link.get('href', '')
+            text = link.get_text(strip=True)
+            
+            # Skip mailto and anchor links
+            if href.startswith('mailto:') or href.startswith('#'):
+                continue
+            
+            # Check if link text looks like a name
+            if self._is_person_name(text):
+                return text
+        
+        # Strategy 2: Look in headings (h1-h6)
+        for tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            headings = element.find_all(tag)
+            for heading in headings:
+                text = heading.get_text(strip=True)
+                if self._is_person_name(text):
+                    return text
+        
+        # Strategy 3: Look in strong/bold tags
+        for tag in ['strong', 'b']:
+            bolds = element.find_all(tag)
+            for bold in bolds:
+                text = bold.get_text(strip=True)
+                if self._is_person_name(text):
+                    return text
+        
+        # Strategy 4: Look in elements with name-related classes
+        name_elements = element.find_all(attrs={'class': re.compile(r'name|title|faculty', re.I)})
+        for elem in name_elements:
+            text = elem.get_text(strip=True)
+            if self._is_person_name(text):
+                return text
+        
+        # Strategy 5: Use regex patterns on full text
+        text = element.get_text()
+        name = self._extract_name_from_text_enhanced(text)
+        if name:
+            return name
+        
+        return None
+
+    def _extract_name_from_text_enhanced(self, text: str) -> Optional[str]:
+        """Enhanced name extraction from text with better patterns."""
+        # Clean the text
+        text = re.sub(r'\s+', ' ', text.strip())
+        
+        # Pattern 1: Dr./Professor FirstName LastName
+        patterns = [
+            r'\b(?:Dr\.?|Professor)\s+([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b',
+            r'\b([A-Z][a-z]+\s+[A-Z][a-z]+)(?:\s*,\s*(?:Professor|Ph\.?D\.?|Chair|Director))',
+            r'\b([A-Z][a-z]+\s+[A-Z][a-z]+)\s*\n',  # Name followed by newline
+            r'^([A-Z][a-z]+\s+[A-Z][a-z]+)',  # Name at start of text
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.MULTILINE)
+            if match:
+                name = match.group(1).strip()
+                if self._is_person_name(name):
+                    return name
+        
+        # Pattern 2: Find all potential names and pick the best one
+        potential_names = re.findall(r'\b[A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b', text)
+        for name in potential_names:
+            if self._is_person_name(name):
+                # Additional validation: make sure it's early in the text (likely to be the person's name)
+                name_position = text.find(name)
+                if name_position < 200:  # Within first 200 characters
+                    return name
+        
+        return None
+
+    def _extract_contact_info_enhanced(self, element, base_url: str) -> Dict:
+        """Enhanced contact info extraction."""
+        info = {}
+        text = element.get_text()
+        
+        # Extract title with better patterns
+        title = self._extract_title_comprehensive(text, element)
+        if title:
+            info['title'] = title
+        
+        # Extract email with multiple methods
+        email = self._extract_email_comprehensive(element)
+        if email:
+            info['email'] = email
+        
+        # Extract phone with better patterns
+        phone_patterns = [
+            r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
+            r'\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
+            r'\d{3}[-.\s]\d{3}[-.\s]\d{4}'
+        ]
+        for pattern in phone_patterns:
+            phone_match = re.search(pattern, text)
+            if phone_match:
+                info['phone'] = phone_match.group(0).strip()
+                break
+        
+        # Extract office/room information
+        office = self._extract_office_info(text)
+        if office:
+            info['office'] = office
+        
+        # Extract profile URL with better logic
+        profile_url = self._extract_profile_url_comprehensive(element, base_url)
+        if profile_url:
+            info['profile_url'] = profile_url
+        
+        # Extract image
+        img = element.find('img')
+        if img and img.get('src'):
+            img_url = urljoin(base_url, img['src'])
+            if img_url and not img_url.endswith(('.svg', '.gif')):  # Skip icons
+                info['image_url'] = img_url
+        
+        return info
+
+    def _extract_title_comprehensive(self, text: str, element) -> Optional[str]:
+        """Extract academic title with comprehensive patterns."""
+        # First try to find title in structured elements
+        title_elements = element.find_all(attrs={'class': re.compile(r'title|position|role', re.I)})
+        for elem in title_elements:
+            elem_text = elem.get_text(strip=True)
+            if len(elem_text) < 100:  # Reasonable title length
+                title_words = ['professor', 'chair', 'director', 'lecturer', 'instructor']
+                if any(word in elem_text.lower() for word in title_words):
+                    return elem_text
+        
+        # Pattern-based extraction
+        title_patterns = [
+            r'((?:Assistant|Associate|Full|Adjunct|Clinical|Research|Emeritus)\s+Professor(?:\s+of\s+[A-Za-z\s&]+)?)',
+            r'(Professor(?:\s+of\s+[A-Za-z\s&]+)?)',
+            r'(Chair(?:\s+of\s+[A-Za-z\s&]+)?)',
+            r'(Director(?:\s+of\s+[A-Za-z\s&]+)?)',
+            r'((?:Senior\s+)?(?:Principal\s+)?(?:Research\s+)?(?:Lecturer|Instructor))',
+            r'(Dean(?:\s+of\s+[A-Za-z\s&]+)?)',
+            r'((?:Senior\s+)?Research\s+(?:Scientist|Professor|Associate))'
+        ]
+        
+        for pattern in title_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                title = match.group(1).strip()
+                if len(title) < 80:  # Reasonable length
+                    return title
+        
+        return None
+
+    def _extract_email_comprehensive(self, element) -> Optional[str]:
+        """Extract email with comprehensive methods."""
+        # Method 1: Mailto links
+        mailto_links = element.find_all('a', href=re.compile(r'^mailto:'))
+        if mailto_links:
+            email = mailto_links[0]['href'].replace('mailto:', '').strip()
+            if self._is_valid_email(email):
+                return email
+        
+        # Method 2: Email in href attributes (sometimes emails are in data attributes)
+        all_links = element.find_all('a', href=True)
+        for link in all_links:
+            href = link.get('href', '')
+            if '@' in href and not href.startswith('mailto:'):
+                # Extract email from URL parameters
+                email_match = re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}', href)
+                if email_match and self._is_valid_email(email_match.group(0)):
+                    return email_match.group(0)
+        
+        # Method 3: Text extraction with better patterns
+        text = element.get_text()
+        email_patterns = [
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+            r'\b[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9.-]+\.\s*[A-Z|a-z]{2,}\b',  # With spaces
+        ]
+        
+        for pattern in email_patterns:
+            email_match = re.search(pattern, text)
+            if email_match:
+                email = re.sub(r'\s+', '', email_match.group(0))  # Remove spaces
+                if self._is_valid_email(email):
+                    return email
+        
+        return None
+
+    def _is_valid_email(self, email: str) -> bool:
+        """Validate email format and common patterns."""
+        if not email or len(email) > 100:
+            return False
+        
+        # Basic email validation
+        if not re.match(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$', email):
+            return False
+        
+        # Skip common false positives
+        false_positives = ['example@', '@example', 'test@', 'admin@', 'info@']
+        if any(fp in email.lower() for fp in false_positives):
+            return False
+        
+        return True
+
+    def _extract_office_info(self, text: str) -> Optional[str]:
+        """Extract office/room information."""
+        office_patterns = [
+            r'(?:Office|Room|Building|Suite)[:]\s*([A-Z]{1,4}[-\s]*\d+[A-Z]?(?:\s*[A-Z])?)',
+            r'(?:Office|Room)[:]\s*(\d+[A-Z]?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)',
+            r'\b([A-Z]{2,4}\s*\d+[A-Z]?)\b',  # Building code + room number
+            r'\b(Room\s+\d+[A-Z]?)\b'
+        ]
+        
+        for pattern in office_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                office = match.group(1).strip()
+                if len(office) < 20:  # Reasonable office length
+                    return office
+        
+        return None
+
+    def _extract_profile_url_comprehensive(self, element, base_url: str) -> Optional[str]:
+        """Extract profile URL with comprehensive logic."""
+        links = element.find_all('a', href=True)
+        
+        # Priority 1: Links with profile-related text
+        profile_keywords = ['profile', 'bio', 'cv', 'resume', 'more', 'details', 'homepage', 'page']
+        for link in links:
+            text = link.get_text().lower()
+            if any(keyword in text for keyword in profile_keywords):
+                href = link['href']
+                if not href.startswith('mailto:') and not href.startswith('#'):
+                    return urljoin(base_url, href)
+        
+        # Priority 2: Links containing person's name
+        name_from_element = self._extract_name_comprehensive(element)
+        if name_from_element:
+            name_parts = name_from_element.lower().split()
+            for link in links:
+                link_text = link.get_text().lower()
+                href = link['href']
+                # Check if link contains name parts
+                if (any(part in link_text for part in name_parts) or 
+                    any(part in href.lower() for part in name_parts)):
+                    if not href.startswith('mailto:') and not href.startswith('#'):
+                        return urljoin(base_url, href)
+        
+        # Priority 3: Any internal link that's not mailto or anchor
+        for link in links:
+            href = link['href']
+            if (href and not href.startswith('mailto:') and 
+                not href.startswith('#') and not href.startswith('tel:')):
+                # Prefer internal links
+                full_url = urljoin(base_url, href)
+                if urlparse(full_url).netloc == urlparse(base_url).netloc:
+                    return full_url
+        
+        return None
+
+    def _extract_research_from_directory_item(self, element) -> Optional[str]:
+        """Extract research interests from directory listing (key enhancement)."""
+        research_sections = []
+        
+        # Look for research in structured elements
+        research_elements = element.find_all(attrs={
+            'class': re.compile(r'research|interest|specialty|focus|area', re.I)
+        })
+        
+        for elem in research_elements:
+            text = elem.get_text(strip=True)
+            if text and len(text) > 20:  # Substantial content
+                research_sections.append(text)
+        
+        # Look for research in paragraphs or divs
+        for tag in ['p', 'div', 'span']:
+            elements = element.find_all(tag)
+            for elem in elements:
+                text = elem.get_text().strip()
+                if len(text) > 30:
+                    # Check if text contains research indicators
+                    research_indicators = [
+                        'research', 'interests', 'focus', 'areas', 'specialization',
+                        'expertise', 'working on', 'studies', 'investigating'
+                    ]
+                    if any(indicator in text.lower() for indicator in research_indicators):
+                        research_sections.append(text)
+        
+        # Look for research in lists
+        lists = element.find_all(['ul', 'ol'])
+        for ul in lists:
+            # Check context to see if it's research-related
+            prev_text = ""
+            if ul.previous_sibling:
+                prev_text = ul.previous_sibling.get_text() if hasattr(ul.previous_sibling, 'get_text') else str(ul.previous_sibling)
+            
+            if any(word in prev_text.lower() for word in ['research', 'interest', 'focus', 'area']):
+                items = [li.get_text(strip=True) for li in ul.find_all('li')]
+                if items:
+                    research_sections.append(' | '.join(items))
+        
+        if research_sections:
+            combined = ' | '.join(research_sections[:3])  # Limit to prevent too much text
+            return combined[:1000]  # Reasonable length limit
+        
+        return None
+
+    def _extract_additional_directory_info(self, element, base_url: str) -> Dict:
+        """Extract additional information that might be in directory listings."""
+        info = {}
+        
+        # Look for department information
+        dept_elements = element.find_all(attrs={'class': re.compile(r'department|dept|school|college', re.I)})
+        for elem in dept_elements:
+            text = elem.get_text(strip=True)
+            if text and len(text) < 100:
+                info['department'] = text
+                break
+        
+        # Look for specialization/expertise tags
+        spec_elements = element.find_all(attrs={'class': re.compile(r'specialization|expertise|tag', re.I)})
+        specializations = []
+        for elem in spec_elements:
+            text = elem.get_text(strip=True)
+            if text and len(text) < 50:
+                specializations.append(text)
+        
+        if specializations:
+            info['specializations'] = ' | '.join(specializations[:5])
+        
+        return info
+
+    def _find_faculty_cards(self, soup: BeautifulSoup, base_url: str) -> List[Dict]:
+        """Enhanced faculty card detection."""
+        faculty_list = []
+        
+        # More comprehensive card selectors
+        card_selectors = [
+            'div[class*="faculty"]',
+            'div[class*="profile"]',
+            'div[class*="person"]',
+            'div[class*="member"]',
+            'div[class*="card"]',
+            'div[class*="item"]',
+            'article',
+            '.faculty-member',
+            '.profile-card',
+            '.person-card',
+            '.staff-card',
+            '[data-person]',
+            '[data-faculty]',
+            '.bio-card',
+            '.directory-item'
+        ]
+        
+        for selector in card_selectors:
+            cards = soup.select(selector)
+            for card in cards:
+                if self._looks_like_faculty_card(card):
+                    faculty_info = self._extract_from_faculty_item(card, base_url)
+                    if faculty_info and self._is_valid_faculty_info(faculty_info):
+                        faculty_list.append(faculty_info)
+        
+        return faculty_list
+
+    def _extract_from_tables(self, soup: BeautifulSoup, base_url: str) -> List[Dict]:
+        """Enhanced table extraction with better column detection."""
+        faculty_list = []
+        
+        tables = soup.find_all('table')
+        for table in tables:
+            # Try to identify column structure
+            header_row = table.find('tr')
+            if header_row:
+                headers = [th.get_text(strip=True).lower() for th in header_row.find_all(['th', 'td'])]
+                
+                # Skip if it doesn't look like a faculty table
+                faculty_indicators = ['name', 'email', 'title', 'professor', 'faculty', 'contact']
+                if not any(indicator in ' '.join(headers) for indicator in faculty_indicators):
+                    continue
+            
+            rows = table.find_all('tr')[1:]  # Skip header row
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+                if len(cells) >= 2:
+                    faculty_info = self._extract_from_table_row_enhanced(row, cells, base_url, headers if 'headers' in locals() else None)
+                    if faculty_info and self._is_valid_faculty_info(faculty_info):
+                        faculty_list.append(faculty_info)
+        
+        return faculty_list
+
+    def _extract_from_table_row_enhanced(self, row, cells, base_url: str, headers: Optional[List[str]]) -> Dict:
+        """Enhanced table row extraction with header awareness."""
+        faculty_info = {}
+        
+        # If we have headers, use them to map data
+        if headers and len(headers) == len(cells):
+            for i, (header, cell) in enumerate(zip(headers, cells)):
+                cell_text = cell.get_text(strip=True)
+                
+                if 'name' in header and self._is_person_name(cell_text):
+                    faculty_info['name'] = cell_text
+                elif 'email' in header or '@' in cell_text:
+                    email = self._extract_email_comprehensive(cell)
+                    if email:
+                        faculty_info['email'] = email
+                elif 'title' in header or 'position' in header:
+                    if cell_text and len(cell_text) < 100:
+                        faculty_info['title'] = cell_text
+                elif 'phone' in header:
+                    if re.search(r'\d{3}[-.\s]\d{3}[-.\s]\d{4}', cell_text):
+                        faculty_info['phone'] = cell_text
+                elif 'office' in header or 'room' in header:
+                    if cell_text and len(cell_text) < 30:
+                        faculty_info['office'] = cell_text
+        
+        # Fallback to general extraction
+        if not faculty_info.get('name'):
+            combined_text = ' '.join(cell.get_text(strip=True) for cell in cells)
+            name = self._extract_name_from_text_enhanced(combined_text)
+            if name:
+                faculty_info['name'] = name
+                
+                # Extract other info from the row
+                additional_info = self._extract_contact_info_enhanced(row, base_url)
+                faculty_info.update(additional_info)
+        
+        # Look for profile links in any cell
+        if not faculty_info.get('profile_url'):
+            for cell in cells:
+                profile_url = self._extract_profile_url_comprehensive(cell, base_url)
+                if profile_url:
+                    faculty_info['profile_url'] = profile_url
+                    break
+        
+        return faculty_info
+
+    def _extract_from_lists(self, soup: BeautifulSoup, base_url: str) -> List[Dict]:
+        """Enhanced list extraction."""
+        faculty_list = []
+        
+        lists = soup.find_all(['ul', 'ol'])
+        for ul in lists:
+            # Check if this list is in a faculty context
+            context_elements = []
+            parent = ul.parent
+            for _ in range(3):  # Check up to 3 levels up
+                if parent and hasattr(parent, 'get_text'):
+                    context_elements.append(parent.get_text().lower())
+                    parent = parent.parent
+                else:
+                    break
+            
+            context = ' '.join(context_elements)
+            faculty_indicators = ['faculty', 'staff', 'professor', 'directory', 'people', 'team']
+            
+            if any(indicator in context for indicator in faculty_indicators):
+                items = ul.find_all('li')
+                for item in items:
+                    if self._looks_like_faculty_item(item):
+                        faculty_info = self._extract_from_faculty_item(item, base_url)
+                        if faculty_info and self._is_valid_faculty_info(faculty_info):
+                            faculty_list.append(faculty_info)
+        
+        return faculty_list
+
+    def _extract_from_containers(self, soup: BeautifulSoup, base_url: str) -> List[Dict]:
+        """Enhanced container extraction with better filtering."""
+        faculty_list = []
+        
+        # Look for divs that might contain individual faculty
+        divs = soup.find_all('div')
+        for div in divs:
+            # Skip if it's too nested (likely a container, not individual faculty)
+            nested_divs = len(div.find_all('div'))
+            if nested_divs > 8:
+                continue
+                
+            # Skip if it's too large (likely contains multiple faculty or whole page)
+            text_length = len(div.get_text())
+            if text_length > 2000:
+                continue
+            
+            # Skip if it's too small (likely not faculty info)
+            if text_length < 50:
+                continue
+            
+            if self._looks_like_faculty_container(div):
+                faculty_info = self._extract_from_faculty_item(div, base_url)
+                if faculty_info and self._is_valid_faculty_info(faculty_info):
+                    faculty_list.append(faculty_info)
+        
+        return faculty_list
+
+    def _looks_like_faculty_card(self, element) -> bool:
+        """Enhanced faculty card detection."""
+        text = element.get_text().lower()
+        
+        # Must have reasonable amount of text
+        if len(text) < 30 or len(text) > 2000:
+            return False
+        
+        # Look for faculty indicators
+        faculty_indicators = [
+            'professor', 'dr.', 'ph.d', 'assistant', 'associate', 'chair', 
+            'director', 'lecturer', 'instructor', 'emeritus', 'research scientist'
+        ]
+        has_title = any(indicator in text for indicator in faculty_indicators)
+        
+        # Look for contact info
+        has_email = '@' in text
+        has_phone = bool(re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text))
+        
+        # Look for name pattern
+        has_name = bool(re.search(r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b', element.get_text()))
+        
+        # Check for profile elements
+        has_image = element.find('img') is not None
+        has_links = len(element.find_all('a', href=True)) > 0
+        
+        # Check for research/academic content
+        research_indicators = ['research', 'interests', 'publications', 'cv', 'curriculum']
+        has_research = any(indicator in text for indicator in research_indicators)
+        
+        return has_name and (has_title or has_email or has_phone or (has_image and has_links) or has_research)
+
+    def _looks_like_faculty_item(self, element) -> bool:
+        """Enhanced faculty item detection."""
+        text = element.get_text().strip()
+        
+        # Should have reasonable length
+        if len(text) < 25 or len(text) > 800:
+            return False
+        
+        # Look for name + additional info pattern
+        has_name = bool(re.search(r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b', text))
+        has_email = '@' in text
+        has_title = any(word in text.lower() for word in [
+            'professor', 'dr.', 'chair', 'director', 'lecturer', 'instructor'
+        ])
+        has_contact = bool(re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text))
+        has_links = len(element.find_all('a', href=True)) > 0
+        
+        return has_name and (has_email or has_title or has_contact or has_links)
+
+    def _looks_like_faculty_container(self, element) -> bool:
+        """Enhanced faculty container detection."""
+        text = element.get_text().strip()
+        
+        if len(text) < 40 or len(text) > 1200:
+            return False
+        
+        # Look for combinations that suggest faculty
+        has_name = bool(re.search(r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b', text))
+        has_email = '@' in text and ('.edu' in text or '.org' in text or '.com' in text)
+        has_title = any(word in text.lower() for word in [
+            'professor', 'dr.', 'assistant', 'associate', 'chair', 'director'
+        ])
+        has_contact = bool(re.search(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text))
+        has_academic = any(word in text.lower() for word in [
+            'research', 'phd', 'ph.d', 'university', 'department'
+        ])
+        
+        # Need name plus at least one other strong indicator
+        return has_name and (has_email or has_title or (has_contact and has_academic))
+
+    def _is_person_name(self, text: str) -> bool:
+        """Enhanced person name validation."""
+        if not text or len(text) > 60:
+            return False
+        
+        # Clean up text
+        text = text.strip()
+        words = text.split()
+        
+        # Should have 2-4 words
+        if len(words) < 2 or len(words) > 4:
+            return False
+        
+        # Should not contain numbers or special characters (except hyphens and apostrophes)
+        if re.search(r'[0-9@#$%^&*()+=\[\]{}|\\:";/<>?]', text):
+            return False
+        
+        # Each significant word should start with capital letter
+        significant_words = [w for w in words if len(w) > 2 or w.lower() in ['jr', 'sr', 'ii', 'iii']]
+        if not all(word[0].isupper() for word in significant_words if word):
+            return False
+        
+        # Should not be common academic titles or department names
+        exclusion_words = [
+            'professor', 'assistant', 'associate', 'chair', 'director', 'dean',
+            'department', 'college', 'school', 'university', 'research', 'computer',
+            'science', 'engineering', 'mathematics', 'physics', 'biology', 'chemistry',
+            'electrical', 'mechanical', 'civil', 'chemical', 'biomedical', 'software',
+            'information', 'systems', 'technology', 'studies', 'program', 'center'
+        ]
+        
+        text_lower = text.lower()
+        if any(exclusion_word in text_lower for exclusion_word in exclusion_words):
+            return False
+        
+        # Should not be common non-name phrases
+        non_names = [
+            'more info', 'contact us', 'learn more', 'click here', 'read more',
+            'view profile', 'full profile', 'see more', 'home page', 'web page'
+        ]
+        if any(non_name in text_lower for non_name in non_names):
+            return False
+        
+        # Additional checks for common false positives
+        if text_lower in ['first name', 'last name', 'full name', 'your name']:
+            return False
+        
+        return True
+
+    def _is_valid_faculty_info(self, faculty_info: Dict) -> bool:
+        """Enhanced validation for faculty information."""
+        # Must have a name
+        name = faculty_info.get('name')
+        if not name:
+            return False
+        
+        # Name should not be a title or department
+        name_lower = name.lower()
+        invalid_names = [
+            'professor', 'chair', 'director', 'department', 'college', 'school',
+            'faculty', 'staff', 'team', 'contact', 'about', 'more info'
+        ]
+        if any(invalid in name_lower for invalid in invalid_names):
+            return False
+        
+        # Should have at least one other piece of meaningful information
+        other_fields = ['title', 'email', 'phone', 'office', 'profile_url', 'research_interests']
+        has_additional_info = any(
+            faculty_info.get(field) and len(str(faculty_info.get(field)).strip()) > 3
+            for field in other_fields
+        )
+        
+        return has_additional_info
+
+    def _clean_and_deduplicate(self, faculty_list: List[Dict]) -> List[Dict]:
+        """Enhanced cleaning and deduplication."""
+        seen = set()
+        cleaned_list = []
+        
+        for faculty in faculty_list:
+            name = faculty.get('name', '').strip()
+            email = faculty.get('email', '').strip()
+            
+            # Skip if no name
+            if not name:
+                continue
+            
+            # Normalize name for comparison (handle different formats)
+            normalized_name = re.sub(r'\s+', ' ', name.lower().strip())
+            normalized_name = re.sub(r'[^\w\s]', '', normalized_name)  # Remove punctuation
+            
+            # Create identifier for deduplication
+            identifier = (normalized_name, email.lower())
+            
+            if identifier not in seen:
+                seen.add(identifier)
+                # Clean up the faculty data
+                cleaned_faculty = self._clean_faculty_data(faculty)
+                cleaned_list.append(cleaned_faculty)
+        
+        return cleaned_list
+
+    def _clean_faculty_data(self, faculty: Dict) -> Dict:
+        """Clean up individual faculty data."""
+        cleaned = {}
+        
+        for key, value in faculty.items():
+            if value:
+                # Convert to string and clean
+                str_value = str(value).strip()
+                
+                # Remove excessive whitespace
+                str_value = re.sub(r'\s+', ' ', str_value)
+                
+                # Clean up specific fields
+                if key == 'name':
+                    # Remove titles that might have been included
+                    str_value = re.sub(r'^(Dr\.?\s+|Professor\s+)', '', str_value, flags=re.IGNORECASE)
+                elif key == 'email':
+                    # Ensure email is lowercase
+                    str_value = str_value.lower()
+                elif key == 'phone':
+                    # Standardize phone format
+                    digits = re.sub(r'[^\d]', '', str_value)
+                    if len(digits) == 10:
+                        str_value = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+                    elif len(digits) == 11 and digits[0] == '1':
+                        str_value = f"({digits[1:4]}) {digits[4:7]}-{digits[7:]}"
+                
+                if str_value:  # Only add non-empty values
+                    cleaned[key] = str_value
+        
+        return cleaned
+
+    def deep_scrape_profiles(self, faculty_list: List[Dict], base_url: str) -> List[Dict]:
+        """Enhanced deep scraping with better data merging."""
+        enhanced_faculty = []
+        max_visits = self.max_profile_visits or len(faculty_list)
+        
+        print(f"Will visit {min(max_visits, len(faculty_list))} profile pages for additional details")
+        
+        for i, faculty in enumerate(faculty_list):
+            if i >= max_visits:
+                enhanced_faculty.extend(faculty_list[i:])
+                break
+            
+            percent = int(((i + 1) / max_visits) * 100)
+            set_progress("scrape", percent)
+
+            profile_url = faculty.get('profile_url')
+            name = faculty.get('name', f'Faculty {i+1}')
+            
+            if profile_url:
+                print(f"Scraping profile {i+1}/{min(max_visits, len(faculty_list))}: {name}")
+                
+                try:
+                    detailed_info = self.scrape_individual_profile(profile_url)
+                    # Merge data intelligently - prioritize directory data for some fields, profile data for others
+                    enhanced_faculty_member = self._merge_faculty_data(faculty, detailed_info)
+                    enhanced_faculty.append(enhanced_faculty_member)
+                    time.sleep(1.5)  # Be respectful with delays
+                except Exception as e:
+                    print(f"   Error scraping profile: {e}")
+                    enhanced_faculty.append(faculty)
+            else:
+                print(f"Skipping {name} - no profile URL found")
+                enhanced_faculty.append(faculty)
+        
+        return enhanced_faculty
+
+    def _merge_faculty_data(self, directory_data: Dict, profile_data: Dict) -> Dict:
+        """Intelligently merge directory and profile data."""
+        merged = directory_data.copy()
+        
+        # For research interests, prefer directory data if it exists and is substantial
+        directory_research = directory_data.get('research_interests', '')
+        profile_research = profile_data.get('research_interests', '')
+        
+        if directory_research and len(directory_research) > 50:
+            # Directory has good research info, supplement with profile if needed
+            if profile_research and len(profile_research) > 50:
+                # Combine both if they're different
+                if directory_research.lower() not in profile_research.lower():
+                    merged['research_interests'] = f"{directory_research} | {profile_research}"
+                else:
+                    merged['research_interests'] = profile_research  # Profile likely more detailed
+        elif profile_research:
+            merged['research_interests'] = profile_research
+        
+        # For email, prefer directory data (often more accessible)
+        if not directory_data.get('email') and profile_data.get('email'):
+            merged['email'] = profile_data['email']
+        
+        # For other fields, prefer profile data as it's usually more detailed
+        profile_priority_fields = ['education', 'biography', 'title', 'phone', 'office']
+        for field in profile_priority_fields:
+            if profile_data.get(field):
+                if not directory_data.get(field) or len(profile_data[field]) > len(directory_data.get(field, '')):
+                    merged[field] = profile_data[field]
+        
+        # Add any new fields from profile
+        for key, value in profile_data.items():
+            if key not in merged and value:
+                merged[key] = value
+        
+        return merged
+
+    def scrape_individual_profile(self, profile_url: str) -> Dict:
+        """Enhanced individual profile scraping."""
+        soup = self.get_page_content(profile_url)
+        if not soup:
+            return {}
+        
+        detailed_info = {}
+        
+        # Extract research interests with comprehensive strategies
+        research = self._extract_research_comprehensive(soup)
+        if research:
+            detailed_info['research_interests'] = research
+            print(f"   Found research: {research[:100]}...")
+        
+        # Extract contact info that might be missing from directory
+        contact_info = self._extract_profile_contact_info(soup)
+        detailed_info.update(contact_info)
+        
+        # Extract education
+        education = self._extract_education_info(soup)
+        if education:
+            detailed_info['education'] = education
+        
+        # Extract biography
+        bio = self._extract_biography_info(soup)
+        if bio:
+            detailed_info['biography'] = bio[:1000]  # Limit length
+        
+        # Extract additional profile-specific information
+        additional_info = self._extract_additional_profile_info(soup)
+        detailed_info.update(additional_info)
+        
+        return detailed_info
+
+    def _extract_profile_contact_info(self, soup: BeautifulSoup) -> Dict:
+        """Extract contact information specifically from profile pages."""
+        contact_info = {}
+        
+        # Look for email in profile pages (often in contact sections)
+        email = self._find_email_in_profile(soup)
+        if email:
+            contact_info['email'] = email
+        
+        # Look for phone numbers
+        phone = self._find_phone_in_profile(soup)
+        if phone:
+            contact_info['phone'] = phone
+        
+        # Look for office information
+        office = self._find_office_in_profile(soup)
+        if office:
+            contact_info['office'] = office
+        
+        return contact_info
+
+    def _find_email_in_profile(self, soup: BeautifulSoup) -> Optional[str]:
+        """Find email specifically in profile pages."""
+        # Look in contact sections
+        contact_sections = soup.find_all(attrs={'class': re.compile(r'contact|email', re.I)})
+        contact_sections.extend(soup.find_all(attrs={'id': re.compile(r'contact|email', re.I)}))
+        
+        for section in contact_sections:
+            email = self._extract_email_comprehensive(section)
+            if email:
+                return email
+        
+        # Look for mailto links anywhere on the page
+        mailto_links = soup.find_all('a', href=re.compile(r'^mailto:'))
+        if mailto_links:
+            email = mailto_links[0]['href'].replace('mailto:', '').strip()
+            if self._is_valid_email(email):
+                return email
+        
+        # Look in structured data (JSON-LD, microdata)
+        email = self._extract_email_from_structured_data(soup)
+        if email:
+            return email
+        
+        return None
+
+    def _extract_email_from_structured_data(self, soup: BeautifulSoup) -> Optional[str]:
+        """Extract email from structured data like JSON-LD."""
+        # Look for JSON-LD structured data
+        json_scripts = soup.find_all('script', type='application/ld+json')
+        for script in json_scripts:
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict):
+                    email = data.get('email')
+                    if email and self._is_valid_email(email):
+                        return email
+                elif isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            email = item.get('email')
+                            if email and self._is_valid_email(email):
+                                return email
+            except:
+                continue
+        
+        return None
+
+    def _find_phone_in_profile(self, soup: BeautifulSoup) -> Optional[str]:
+        """Find phone number in profile page."""
+        text = soup.get_text()
+        
+        # More comprehensive phone patterns
+        phone_patterns = [
+            r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}(?:\s*(?:ext|x)\s*\d+)?',
+            r'\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
+            r'\d{3}[-.\s]\d{3}[-.\s]\d{4}'
+        ]
+        
+        for pattern in phone_patterns:
+            match = re.search(pattern, text)
+            if match:
+                phone = match.group(0).strip()
+                # Validate it's not part of other data (like dates)
+                if not re.search(r'(19|20)\d{2}', phone):
+                    return phone
+        
+        return None
+
+    def _find_office_in_profile(self, soup: BeautifulSoup) -> Optional[str]:
+        """Find office information in profile page."""
+        text = soup.get_text()
+        
+        # Enhanced office patterns
+        office_patterns = [
+            r'(?:Office|Room|Building|Suite)[:]\s*([A-Z]{1,4}[-\s]*\d+[A-Z]?(?:\s*[A-Z])?)',
+            r'(?:Office|Room)[:]\s*(\d+[A-Z]?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)',
+            r'\b([A-Z]{2,4}\s*[-]?\s*\d+[A-Z]?)\b(?:\s*(?:Office|Room))?',
+            r'(?:Located in|Office in)\s+([A-Z][a-z]+\s+(?:Hall|Building)\s+\d+[A-Z]?)'
+        ]
+        
+        for pattern in office_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                office = match.group(1).strip()
+                if len(office) < 30:  # Reasonable office length
+                    return office
+        
+        return None
+
+    def _extract_additional_profile_info(self, soup: BeautifulSoup) -> Dict:
+        """Extract additional information from profile pages."""
+        additional_info = {}
+        
+        # Look for publications count or recent publications
+        publications = self._extract_publications_info(soup)
+        if publications:
+            additional_info['publications'] = publications
+        
+        # Look for courses taught
+        courses = self._extract_courses_info(soup)
+        if courses:
+            additional_info['courses'] = courses
+        
+        # Look for awards or honors
+        awards = self._extract_awards_info(soup)
+        if awards:
+            additional_info['awards'] = awards
+        
+        return additional_info
+
+    def _extract_publications_info(self, soup: BeautifulSoup) -> Optional[str]:
+        """Extract publications information."""
+        pub_sections = soup.find_all(attrs={'class': re.compile(r'publication|paper|journal', re.I)})
+        pub_sections.extend(soup.find_all(attrs={'id': re.compile(r'publication|paper|journal', re.I)}))
+        
+        if pub_sections:
+            pub_texts = []
+            for section in pub_sections[:3]:  # Limit to first 3 sections
+                text = section.get_text(strip=True)
+                if len(text) > 50:
+                    pub_texts.append(text[:200])  # Limit length
+            
+            if pub_texts:
+                return ' | '.join(pub_texts)
+        
+        return None
+
+    def _extract_courses_info(self, soup: BeautifulSoup) -> Optional[str]:
+        """Extract courses/teaching information."""
+        course_sections = soup.find_all(attrs={'class': re.compile(r'course|teaching|class', re.I)})
+        course_sections.extend(soup.find_all(attrs={'id': re.compile(r'course|teaching|class', re.I)}))
+        
+        if course_sections:
+            course_texts = []
+            for section in course_sections[:2]:  # Limit to first 2 sections
+                text = section.get_text(strip=True)
+                if len(text) > 30:
+                    course_texts.append(text[:150])  # Limit length
+            
+            if course_texts:
+                return ' | '.join(course_texts)
+        
+        return None
+
+    def _extract_awards_info(self, soup: BeautifulSoup) -> Optional[str]:
+        """Extract awards/honors information."""
+        award_sections = soup.find_all(attrs={'class': re.compile(r'award|honor|recognition', re.I)})
+        award_sections.extend(soup.find_all(attrs={'id': re.compile(r'award|honor|recognition', re.I)}))
+        
+        if award_sections:
+            award_texts = []
+            for section in award_sections[:2]:  # Limit to first 2 sections
+                text = section.get_text(strip=True)
+                if len(text) > 20:
+                    award_texts.append(text[:100])  # Limit length
+            
+            if award_texts:
+                return ' | '.join(award_texts)
+        
+        return None
+
+    def _extract_research_comprehensive(self, soup: BeautifulSoup) -> Optional[str]:
+        """Enhanced research extraction with more strategies."""
+        research_sections = []
+        
+        # Strategy 1: Dedicated research sections by headings
+        research_keywords = ['research', 'interests', 'areas', 'focus', 'specialization', 'expertise']
+        headings = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+        
+        for heading in headings:
+            heading_text = heading.get_text().lower()
+            if any(keyword in heading_text for keyword in research_keywords):
+                content_parts = self._extract_content_after_heading(heading)
+                if content_parts:
+                    research_sections.extend(content_parts)
+        
+        # Strategy 2: Look for research in structured sections
+        research_divs = soup.find_all(attrs={'class': re.compile(r'research|interest|focus|area', re.I)})
+        research_divs.extend(soup.find_all(attrs={'id': re.compile(r'research|interest|focus|area', re.I)}))
+        
+        for div in research_divs:
+            text = div.get_text(strip=True)
+            if len(text) > 50 and len(text) < 2000:  # Reasonable length
+                research_sections.append(text)
+        
+        # Strategy 3: Look for research-related paragraphs
+        paragraphs = soup.find_all('p')
+        research_context_words = [
+            'research', 'studying', 'investigating', 'focus', 'specializ',
+            'work on', 'interests include', 'projects', 'current work',
+            'my research', 'research area', 'working in'
+        ]
+        
+        for p in paragraphs:
+            text = p.get_text().strip()
+            if len(text) > 80:
+                text_lower = text.lower()
+                if any(word in text_lower for word in research_context_words):
+                    # Additional validation - should mention academic/technical terms
+                    if any(term in text_lower for term in [
+                        'algorithm', 'model', 'system', 'method', 'analysis', 'study',
+                        'development', 'design', 'theory', 'application', 'data',
+                        'machine learning', 'artificial intelligence', 'computer'
+                    ]):
+                        research_sections.append(text)
+        
+        # Strategy 4: Look for research in lists with context
+        lists = soup.find_all(['ul', 'ol'])
+        for ul in lists:
+            # Check context around the list
+            context_text = ""
+            prev = ul.previous_sibling
+            for _ in range(3):
+                if prev and hasattr(prev, 'get_text'):
+                    context_text += prev.get_text().lower() + " "
+                    prev = prev.previous_sibling
+                elif prev:
+                    prev = prev.previous_sibling
+                else:
+                    break
+            
+            if any(keyword in context_text for keyword in research_keywords):
+                items = [li.get_text(strip=True) for li in ul.find_all('li')]
+                if items and len(' '.join(items)) > 50:
+                    research_sections.append(' | '.join(items))
+        
+        # Combine and clean research sections
+        if research_sections:
+            unique_sections = []
+            seen_content = set()
+            
+            for section in research_sections:
+                # Normalize for comparison
+                normalized = re.sub(r'\s+', ' ', section.lower().strip())
+                if len(normalized) > 30 and normalized not in seen_content:
+                    seen_content.add(normalized)
+                    unique_sections.append(section.strip())
+            
+            if unique_sections:
+                combined = ' | '.join(unique_sections[:4])
+                combined = re.sub(r'\s+', ' ', combined)
+                return combined[:2000]
+        
+        return None
+
+    def _extract_content_after_heading(self, heading) -> List[str]:
+        """Extract content that follows a heading until the next heading."""
+        content_parts = []
+        current = heading.next_sibling
+        
+        while current and len(content_parts) < 5:
+            if hasattr(current, 'name'):
+                if current.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                    break
+                
+                if current.name in ['p', 'div', 'ul', 'ol']:
+                    text = current.get_text(strip=True)
+                    if text and len(text) > 30:
+                        content_parts.append(text)
+            
+            current = current.next_sibling
+        
+        return content_parts
+
+    def _extract_education_info(self, soup: BeautifulSoup) -> Optional[str]:
+        """Enhanced education extraction."""
+        education_sections = []
+        education_keywords = ['education', 'degrees', 'phd', 'ph.d', 'master', 'bachelor', 'university', 'degree']
+        
+        # Look for structured education sections
+        edu_sections = soup.find_all(attrs={'class': re.compile(r'education|degree|academic', re.I)})
+        edu_sections.extend(soup.find_all(attrs={'id': re.compile(r'education|degree|academic', re.I)}))
+        
+        for section in edu_sections:
+            text = section.get_text(strip=True)
+            if text and len(text) > 20:
+                education_sections.append(text)
+        
+        # Look for education-related headings
+        headings = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+        for heading in headings:
+            heading_text = heading.get_text().lower()
+            if any(keyword in heading_text for keyword in education_keywords):
+                content = self._extract_content_after_heading(heading)
+                if content:
+                    education_sections.extend(content)
+        
+        # Look for education in paragraphs
+        paragraphs = soup.find_all('p')
+        for p in paragraphs:
+            text = p.get_text().strip()
+            if len(text) > 40:
+                text_lower = text.lower()
+                if any(keyword in text_lower for keyword in education_keywords):
+                    # Additional validation for education content
+                    if any(term in text_lower for term in [
+                        'university', 'college', 'institute', 'school', 'degree',
+                        'graduated', 'studied', 'b.s.', 'm.s.', 'ph.d', 'phd'
+                    ]):
+                        education_sections.append(text)
+        
+        if education_sections:
+            # Clean and combine education sections
+            unique_edu = []
+            for edu in education_sections[:3]:  # Limit to first 3
+                cleaned = re.sub(r'\s+', ' ', edu.strip())
+                if len(cleaned) < 500:  # Reasonable length
+                    unique_edu.append(cleaned)
+            
+            if unique_edu:
+                return ' | '.join(unique_edu)
+        
+        return None
+
+    def _extract_biography_info(self, soup: BeautifulSoup) -> Optional[str]:
+        """Enhanced biography extraction."""
+        bio_sections = []
+        bio_keywords = ['biography', 'about', 'bio', 'overview', 'background', 'profile']
+        
+        # Look for structured bio sections
+        bio_divs = soup.find_all(attrs={'class': re.compile(r'bio|about|overview|profile', re.I)})
+        bio_divs.extend(soup.find_all(attrs={'id': re.compile(r'bio|about|overview|profile', re.I)}))
+        
+        for section in bio_divs:
+            text = section.get_text(strip=True)
+            if text and len(text) > 100:  # Substantial bio content
+                bio_sections.append(text)
+        
+        # Look for bio-related headings
+        headings = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+        for heading in headings:
+            heading_text = heading.get_text().lower()
+            if any(keyword in heading_text for keyword in bio_keywords):
+                content = self._extract_content_after_heading(heading)
+                if content:
+                    bio_sections.extend(content)
+        
+        if bio_sections:
+            # Take the longest/most comprehensive bio section
+            bio_sections.sort(key=len, reverse=True)
+            best_bio = bio_sections[0] if bio_sections else ""
+            
+            if len(best_bio) > 100:
+                # Clean up the bio
+                cleaned_bio = re.sub(r'\s+', ' ', best_bio.strip())
+                return cleaned_bio[:1200]  # Limit length
+        
+        return None
+
+    def save_to_excel(self, faculty_list: List[Dict], filename: str = 'faculty.xlsx'):
+        """Enhanced Excel saving with better formatting and statistics."""
+        if not faculty_list:
+            print("No faculty data to save")
+            return
+        
+        df = pd.DataFrame(faculty_list)
+        
+        # Reorder columns for better presentation
+        preferred_order = [
+            'name', 'title', 'email', 'phone', 'office', 'department',
+            'research_interests', 'education', 'biography', 'specializations',
+            'publications', 'courses', 'awards', 'profile_url', 'image_url'
+        ]
+        
+        available_cols = [col for col in preferred_order if col in df.columns]
+        other_cols = [col for col in df.columns if col not in preferred_order]
+        final_columns = available_cols + other_cols
+        
+        if final_columns:
+            df = df[final_columns]
+        
+        # Save with enhanced formatting
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Faculty Directory', index=False)
+            
+            worksheet = writer.sheets['Faculty Directory']
+            
+            # Set column widths based on content type
+            column_widths = {
+                'name': 25, 'title': 35, 'email': 30, 'phone': 15, 'office': 15,
+                'department': 25, 'research_interests': 70, 'education': 45,
+                'biography': 50, 'specializations': 30, 'publications': 40,
+                'courses': 35, 'awards': 30, 'profile_url': 40, 'image_url': 30
+            }
+            
+            for i, column in enumerate(df.columns, 1):
+                col_letter = self._get_excel_column_letter(i)
+                width = column_widths.get(column, 20)
+                worksheet.column_dimensions[col_letter].width = width
+            
+            # Add header formatting
+            try:
+                from openpyxl.styles import Font, PatternFill, Alignment
+                
+                header_font = Font(bold=True, color='FFFFFF')
+                header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+                header_alignment = Alignment(horizontal='center', vertical='center')
+                
+                for col in range(1, len(df.columns) + 1):
+                    cell = worksheet.cell(row=1, column=col)
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = header_alignment
+                    
+                # Enable text wrapping for content cells
+                for row in range(2, len(df) + 2):
+                    for col in range(1, len(df.columns) + 1):
+                        cell = worksheet.cell(row=row, column=col)
+                        cell.alignment = Alignment(wrap_text=True, vertical='top')
+                        
+            except ImportError:
+                print("Note: openpyxl styles not available - basic formatting applied")
+        
+        print(f"\nSaved to {filename}")
+        print(f"Total faculty: {len(df)}")
+        
+        # Enhanced statistics
+        self._print_detailed_statistics(df, faculty_list)
+
+    def _get_excel_column_letter(self, col_num: int) -> str:
+        """Convert column number to Excel column letter."""
+        result = ""
+        while col_num > 0:
+            col_num -= 1
+            result = chr(65 + col_num % 26) + result
+            col_num //= 26
+        return result
+
+    def _print_detailed_statistics(self, df: pd.DataFrame, faculty_list: List[Dict]):
+        """Print detailed statistics about the scraped data."""
+        print("\n" + "="*50)
+        print("SCRAPING STATISTICS")
+        print("="*50)
+        
+        # Data completeness
+        print("\nData Completeness:")
+        print("-" * 20)
+        
+        important_fields = [
+            'name', 'title', 'email', 'phone', 'office', 'research_interests',
+            'education', 'biography', 'profile_url'
+        ]
+        
+        for field in important_fields:
+            if field in df.columns:
+                count = len([f for f in faculty_list if f.get(field) and str(f.get(field)).strip()])
+                percentage = (count / len(df)) * 100
+                status = "✓" if percentage > 50 else "!" if percentage > 20 else "✗"
+                print(f"  {status} {field:20}: {count:3}/{len(df)} ({percentage:5.1f}%)")
+        
+        # Research interests analysis
+        research_faculty = [f for f in faculty_list if f.get('research_interests')]
+        if research_faculty:
+            print(f"\nResearch Interests Analysis:")
+            print("-" * 30)
+            print(f"Faculty with research info: {len(research_faculty)}")
+            
+            # Count common research terms
+            all_research = ' '.join([f.get('research_interests', '').lower() for f in research_faculty])
+            common_terms = [
+                'machine learning', 'artificial intelligence', 'computer vision',
+                'data mining', 'algorithms', 'software engineering', 'networks',
+                'security', 'database', 'systems', 'theory', 'graphics'
+            ]
+            
+            print("Common research areas:")
+            for term in common_terms:
+                count = all_research.count(term)
+                if count > 0:
+                    print(f"  • {term}: {count} mentions")
+        
+        # Contact information summary
+        email_count = len([f for f in faculty_list if f.get('email')])
+        phone_count = len([f for f in faculty_list if f.get('phone')])
+        office_count = len([f for f in faculty_list if f.get('office')])
+        
+        print(f"\nContact Information:")
+        print("-" * 20)
+        print(f"  Email addresses: {email_count}")
+        print(f"  Phone numbers: {phone_count}")
+        print(f"  Office locations: {office_count}")
+        
+        # Profile URL analysis
+        profile_count = len([f for f in faculty_list if f.get('profile_url')])
+        if profile_count > 0:
+            print(f"\nProfile Pages:")
+            print("-" * 15)
+            print(f"  Faculty with profile URLs: {profile_count}")
+            print(f"  Deep scrape coverage: {min(self.max_profile_visits or profile_count, profile_count)}")
+
+    def __del__(self):
+        """Clean up resources."""
+        if hasattr(self, 'driver'):
+            try:
+                self.driver.quit()
+            except:
+                pass
+
+
+# Enhanced usage example with error handling and logging
+if __name__ == "__main__":
+    import argparse
+    import logging
+    
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    # Command line arguments
+    parser = argparse.ArgumentParser(description='Enhanced Faculty Scraper')
+    parser.add_argument('url', help='Faculty directory URL to scrape')
+    parser.add_argument('--selenium', action='store_true', help='Use Selenium for JavaScript-heavy sites')
+    parser.add_argument('--max-profiles', type=int, default=None, help='Maximum number of profiles to deep scrape')
+    parser.add_argument('--output', default='faculty_data.xlsx', help='Output Excel filename')
+    parser.add_argument('--no-deep-scrape', action='store_true', help='Skip deep scraping of individual profiles')
+    
+    args = parser.parse_args()
+    
+    print(f"Enhanced Faculty Scraper")
+    print(f"Output directory: {os.getcwd()}")
+    print(f"Target URL: {args.url}")
+    print("-" * 60)
+    
+    try:
+        scraper = EnhancedFacultyScraper(
+            use_selenium=args.selenium,
+            deep_scrape=not args.no_deep_scrape,
+            max_profile_visits=args.max_profiles
+        )
+        
+        faculty_data = scraper.scrape_faculty(args.url)
+        
+        if faculty_data:
+            scraper.save_to_excel(faculty_data, args.output)
+            print(f"\n✓ Success! Excel file saved: {os.path.join(os.getcwd(), args.output)}")
+        else:
+            print("\n✗ No faculty data found. The site might:")
+            print("  • Require JavaScript (try --selenium flag)")
+            print("  • Have an unusual structure")
+            print("  • Be blocking automated requests")
+            
+    except KeyboardInterrupt:
+        print("\n\nScraping interrupted by user")
+    except Exception as e:
+        print(f"\n✗ Error occurred: {e}")
+        logging.exception("Scraping failed")
+    
+    print("\nScraping completed.")

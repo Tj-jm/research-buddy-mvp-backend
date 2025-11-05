@@ -1,0 +1,27 @@
+📦 User Interface (Web)
+│
+├── Upload PDF
+│   └── PDF Parser
+│        └── Extract Abstract, Title, Content
+│
+├── Category Prediction Panel
+│   └── Traditional ML Models (Naive Bayes, Logistic Regression, SVM, KNN, etc.)
+│        └── Confidence Scoring + Comparison Table
+│
+├── Summary Generator
+│   └── NLP/DL Model or LLM (e.g., BART, T5, GPT)
+│
+├── QnA Chat Interface
+│   └── LLM Backend (OpenAI/Gemini API)
+│        └── LangChain w/ Retrieval over PDF Content
+│
+└── Display Results + Optional Download (Summary/Prediction/Answers)
+
+
+| Model               | Approach                          | Notes                     |
+| ------------------- | --------------------------------- | ------------------------- |
+| `SimpleFeedForward` | On top of TF-IDF or embeddings    | Fast training, good intro |
+| `LSTM` / `BiLSTM`   | Sequential abstract understanding | Needs padded input        |
+| `CNN for Text`      | Detects n-gram–style features     | Lightweight alternative   |
+| `DistilBERT`        | Transformer encoder, fast BERT    | Recommended               |
+| `BERT` / `SciBERT`  | Domain-specific, powerful         | More training time        |

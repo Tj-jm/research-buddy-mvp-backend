@@ -1,0 +1,5 @@
+mongod --config D:\mongodb\bin\mongod.cfg        
+
+tasklist | findstr mongod
+
+taskkill /PID 1234 /F
